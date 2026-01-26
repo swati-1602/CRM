@@ -113,3 +113,4 @@ plot(B,mse_8,type = "l")
 plot(B,mse_9,type = "l")
 
 
+
