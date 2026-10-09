@@ -15,6 +15,7 @@ cl <- makeCluster(n_cores)
 registerDoParallel(cl)
 
 # Sample sizes
+#sample_size <- seq(50, 100, 50)
 sample_size <- seq(50, 1000, 50)
 
 ## ---------------------------------------------------------------------
@@ -88,201 +89,160 @@ scls_loss <- function(beta, y, x){
 
 # Tunning constant
 set.seed(123)
-Tun_cons <- function(beta, n) {
+Tun_cons <- function(beta, delta, n) {
   
   ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
+  z_1<-runif(n)
+  v_1<-rnorm(n)
+  x_1<-rnorm(n)
   
   ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
+  x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
   
-  # =========================
-  # Stage 1: LSE (control function)
-  # =========================
-  res <- residuals(lm(x_2 ~ z + x_1))
+  # ==================================================
+  # Stage 1: LSE (control function)  ->  v_1_hat
+  # ==================================================
+  res <- residuals(lm(x_2 ~ z_1 + x_1))
   
   ## Structural error
-  #error <- rnorm(n)
   
-  #error <- rcauchy(n)
+  ## Standard Normal
+  epsilon <- rnorm(n)
   
-  #error <- rt(n, 3)
-  
-  # Indicator for contaminated observations
-  contam <- rbinom(n, 1, 0.20)
-  
-  # Generate contaminated errors
-  error <- ifelse(contam == 0,
-                  rnorm(n, 0, 1),
-                  rnorm(n, 0, 5))
-  
-  #Laplace distribution
-  #error<-rLaplace(n)
-  
-  # Heteroskedastic error where variance depends on x1 and x2
-  #sigma_2 <- sqrt(abs(beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4]*e_1))
-  #error <- rnorm(n, mean = 0, sd = sigma_2)
-  
-  ##-----------------------------------------------------------
   ## Latent response + left-censoring at zero
-  ##-----------------------------------------------------------
-  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4] * e_1 + error
+  y_star  <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4]*e_1 + epsilon
   c_fixed <- 0
-  y<- pmax(c_fixed, y_star)
+         y<- pmax(c_fixed, y_star)
+  
   # 1 = uncensored, 0 = censored
-  event  <- as.numeric(y_star > c_fixed)   
+  event   <- as.numeric(y_star > c_fixed) 
+  c_p     <- mean(y == c_fixed) * 100
   
-  c_p <-(sum(y==c_fixed)/length(y))*100
-  
-  dat <- data.frame(y, x_1, x_2, res, event)
-  
-  dat$yc <- rep(0, nrow(dat))
+  dat    <- data.frame(y, x_1, x_2, res, event)
+  dat$yc <- rep(c_fixed, nrow(dat))
   
   ##-----------------------------------------------------------
-  ## STEP 1: Fit CLAD (censored quantile / Powell estimator) -> beta_hat
+  ## STEP 2: Initial estimator -- CLAD (Powell)  ->  beta_hat
   ##-----------------------------------------------------------
   fit <- crq(Curv(y, yc, ctype = "left") ~ x_1 + x_2 + res,
-             data = dat, method = "Pow", tau = 0.5)
+                  data = dat, method = "Pow", tau = 0.5)
   beta_hat <- coef(fit)
   
-  Xmat        <- model.matrix(~ x_1 + x_2 + res, data = dat)
-  fitted_vals <- as.vector(Xmat %*% beta_hat)
+  # xhat_i' beta_hat
+  Xmat<- model.matrix(~ x_1 + x_2 + res, data = dat)
+  fitted_vals <- as.vector(Xmat %*% beta_hat)        
   
   ##-----------------------------------------------------------
-  ## STEP 2: For UNCENSORED obs -> exact true residuals
-  ## STEP 3: For CENSORED obs   -> only the inequality y_i* <= 0
-  ##          => e_i <= r_i  (r_i computed using observed y_i, which is 0)
-  ##          This inequality is only informative for |e_i| when r_i <= 0.
-  ##          Censored points with r_i > 0 carry no usable bound and
-  ##          must be excluded -- this is NOT "ignoring censored data",
-  ##          it is exactly what the algorithm means by "providing only
-  ##          the inequality" (i.e. some censored points are uninformative).
+  ## STEP 3: Right-censored sample  {-r_i}  (signed, NOT absolute)
+  ##   Y_i > 0 :  -r_i = xhat_i'beta_hat - Y_i   (observed, event = 1)
+  ##   Y_i = 0 :  -r_i = xhat_i'beta_hat         (censored at threshold, event = 0)
+  ##   Both cases equal  fitted - y.  No observations are dropped.
   ##-----------------------------------------------------------
-  r_i <- dat$y - fitted_vals
+  neg_r <- fitted_vals - dat$y
   
-  keep       <- !(dat$event == 0 & r_i > 0)
-  n_excluded <- sum(!keep)
-  
-  abs_r   <- abs(r_i[keep])
-  event_k <- dat$event[keep]     # 1 = exact residual, 0 = right-censored |e_i|
+  # survfit needs positive times -> shift by a constant, shift back afterwards
+  shift <- -min(neg_r) + 1
+  km_fit <- survfit(Surv(neg_r + shift, event) ~ 1)
   
   ##-----------------------------------------------------------
-  ## STEP 4: Robust estimator of residual distribution
-  ##          = uncensored exact residuals + censoring info (KM)
+  ## STEP 4: Quantiles of the KM-estimated distribution of -r_i
+  ##   Tuning constant for level tau (symmetric version):
+  ##     c(tau) = max( Q((1+tau)/2), -Q((1-tau)/2) )
+  ##   i.e. the tau-quantile of |r| implied by the signed distribution.
   ##-----------------------------------------------------------
-  km_fit <- survfit(Surv(abs_r, event_k) ~ 1)
+  last_event <- max(km_fit$time[km_fit$n.event > 0])
   
-  ##-----------------------------------------------------------
-  ## STEP 5: Quantiles of the estimated residual distribution
-  ##-----------------------------------------------------------
-  tau_levels <- c(0.50, 0.75, 0.85)
-  Q <- quantile(km_fit, probs = tau_levels)$quantile
+  Qfun <- function(p) {
+    q <- unname(quantile(km_fit, probs = p)$quantile)
+    # heavy censoring: curve never reaches p
+    if (is.na(q)) q <- last_event                    
+    q - shift
+  }
   
-  Q50 <- unname(Q[1])
-  Q75 <- unname(Q[2])
-  Q85 <- unname(Q[3])
+  c_tau <- function(tau) max(Qfun((1 + tau)/2), -Qfun((1 - tau)/2), 1e-6)
+  tau_levels = c(0.65, 0.75, 0.85)
   
-  Huber_c <- Q85
-  Hampel_a <- Q50
+  Q65 <- c_tau(tau_levels[1])
+  Q75 <- c_tau(tau_levels[2])
+  Q85 <- c_tau(tau_levels[3])
+  
+  Huber_c  <- Q65
+  Hampel_a <- Q65
   Hampel_b <- Q75
   Hampel_c <- Q85
-  Tukey_c <- Q85
+  Tukey_c  <- Q85
   
   ##-----------------------------------------------------------
   ## Return results
   ##-----------------------------------------------------------
   return(c(
-    beta_hat   = beta_hat,
-    Huber_c    = Huber_c,
-    Hampel_a   = Hampel_a,
-    Hampel_b   = Hampel_b,
-    Hampel_c   = Hampel_c,
-    Tukey_c    = Tukey_c,
-    c_p = c_p
+    Huber_c  = Huber_c,
+    Hampel_a = Hampel_a,
+    Hampel_b = Hampel_b,
+    Hampel_c = Hampel_c,
+    Tukey_c  = Tukey_c
   ))
 }
 
 
-### initial parameter
-set.seed(123)
-mle_par <- function(beta, n) {
-  
-  ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
-  
-  ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
-  
-  ## First-stage residuals
-  res <- residuals(lm(x_2 ~ z + x_1))
-  
-  
-  ## Latent response
-  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4] * e_1 + rnorm(n)
-  
-  ## Left-censored response
-  y <- pmax(0, y_star)
-  
-  ## Data
-  data <- data.frame(y, x_1, x_2, res)
-  
-  ## Tobit MLE
-  mle_fit <- tobit(y ~ x_1 + x_2 + res,left = 0, data = data,control = survreg.control(maxiter = 1000))
-  
-  ## Return both estimates and data
-  return(as.numeric(coef(mle_fit)))
-}
+### inital parameter
+ set.seed(123)
+ mle_par <- function(beta, delta, n) {
+   # beta  = (b0, b1, b2): intercept, x_1, x_2 in the outcome equation
+   # delta = (d0, d1, d2): intercept, x_1, z in the first stage
+   
+   z_1<-runif(n)
+   x_1<-rnorm(n)
+   
+   ## eta = first-stage error, eps = outcome error (as in your notes)
+   Sigma <- matrix(c(1, beta[4], beta[4], 1), 2, 2)
+   err <- mvrnorm(n, mu = c(0, 0), Sigma = Sigma)
+   v_1 <- err[, 1]
+   epsilon <- err[, 2]
+   
+   ## Endogenous regressor
+   x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
+   
+   ## First-stage residuals
+   res <- residuals(lm(x_2 ~ x_1 + z_1))
+   
+   ## Latent and censored response
+   y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + epsilon
+   y <- pmax(0, y_star)
+   
+   data <- data.frame(y, x_1, x_2, res)
+   
+   fit <- tobit(y ~ x_1 + x_2 + res, left = 0, data = data,
+                control = survreg.control(maxiter = 1000))
+   
+   as.numeric(coef(fit))
+ }
+ 
 
-### clad loss
+### quantile loss
 set.seed(123)
-f_1_clad<- function(beta, n) {
+f_1_quantile<-function(beta, delta, n) {
   
   ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
+  z_1<-runif(n)
+  v_1<-rnorm(n)
+  x_1<-rnorm(n)
   
   ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
+  x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
   
   # =========================
   # Stage 1: LSE
   # =========================
-  res <- residuals(lm(x_2 ~ z + x_1))
+  res <- residuals(lm(x_2 ~ z_1 + x_1))
   
   ## Structural error
   
   ## Standard Normal
-  #error <- rnorm(n)
-  
-  # Cauchy distribution
-  #error <-  rcauchy(n)
-  
-  ## Student t Distribution
-   #error <- rt(n,3)
-  
-  # Indicator for contaminated observations
-  contam <- rbinom(n, 1, 0.20)
-  
-  # Generate contaminated errors
-  error <- ifelse(contam == 0,
-                  rnorm(n, 0, 1),
-                  rnorm(n, 0, 5))
-  
-  #Laplace distribution
-  #error<-rLaplace(n)
-  
-  # Heteroskedastic error where variance depends on x1 and x2
-  #sigma_2 <- sqrt(abs(beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4]*e_1))
-  
-  #error <- rnorm(n, mean = 0, sd = sigma_2)
+  epsilon <- rnorm(n)
   
   ## Latent variable
-  y_star<- beta[1] + beta[2]*x_1 + beta[3]*x_2  + beta[4]*e_1 + error
+  y_star<- beta[1]+beta[2]*x_1+beta[3]*x_2+beta[4]*v_1 + epsilon
   
   ## Censored outcome
   y <- pmax(0, y_star)
@@ -302,7 +262,7 @@ f_1_clad<- function(beta, n) {
   }
   
   # Use MLE as initial values
-  mle_p<-mle_par(beta,n)
+  mle_p<-mle_par(beta, delta, n)
   init <- as.numeric(mle_p)
   
   clad_fit <- optim(init, f_d, method = "Nelder-Mead")
@@ -313,50 +273,29 @@ f_1_clad<- function(beta, n) {
 
 ### Scls loss
 set.seed(123)
-f_1_scls<- function(beta, n) {
+f_1_scls<- function(beta, delta, n) {
   
   ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
+  z_1<-runif(n)
+  v_1<-rnorm(n)
+  x_1<-rnorm(n)
   
   ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
+  x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
   
   # =========================
   # Stage 1: LSE
   # =========================
-  res <- residuals(lm(x_2 ~ z + x_1))
+  res <- residuals(lm(x_2 ~ z_1 + x_1))
   
   ## Structural error
   
   ## Standard Normal
-  #error <- rnorm(n)
+  epsilon <- rnorm(n)
   
-  # Cauchy distribution
-  #error <-  rcauchy(n)
-  
-  #Laplace distribution
-  #error<-rLaplace(n)
-  
-  ## Student t Distribution
-   #error <- rt(n,3)
-  
-  # Indicator for contaminated observations
-  contam <- rbinom(n, 1, 0.20)
-  
-  # Generate contaminated errors
-  error <- ifelse(contam == 0,
-                  rnorm(n, 0, 1),
-                  rnorm(n, 0, 5))
-  
-  # Heteroskedastic error where variance depends on x1 and x2
-  #sigma_2 <- sqrt(abs(beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4]*e_1))
-  
-  #error <- rnorm(n, mean = 0, sd = sigma_2)
   
   ## Latent variable
-  y_star<- beta[1] + beta[2]*x_1 + beta[3]*x_2  + beta[4]*e_1 + error
+  y_star<- beta[1] + beta[2]*x_1 + beta[3]*x_2  + beta[4]*v_1 + epsilon
   
   ## Censored outcome
   y <- pmax(0, y_star)
@@ -375,7 +314,7 @@ f_1_scls<- function(beta, n) {
   }
   
   # Use MLE as initial values
-  mle_p<-mle_par(beta,n)
+  mle_p<-mle_par(beta, delta, n)
   init <- as.numeric(mle_p)
   
   scls_fit <- optim(init, f_s, method = "Nelder-Mead")
@@ -386,50 +325,28 @@ f_1_scls<- function(beta, n) {
 
 ### Huber loss
 set.seed(123)
-f_1_huber<- function(beta, n) {
+f_1_huber<- function(beta, delta, n) {
   
   ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
+  z_1<-runif(n)
+  v_1<-rnorm(n)
+  x_1<-rnorm(n)
   
   ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
+  x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
   
   # =========================
   # Stage 1: LSE
   # =========================
-  res <- residuals(lm(x_2 ~ z + x_1))
+  res <- residuals(lm(x_2 ~ z_1 + x_1))
   
   ## Structural error
   
   ## Standard Normal
-  #error <- rnorm(n)
-  
-  # Cauchy distribution
-  #error <-  rcauchy(n)
-  
-  ## Student t Distribution
-   #error <- rt(n,3)
-  
-  # Indicator for contaminated observations
-  contam <- rbinom(n, 1, 0.20)
-  
-  # Generate contaminated errors
-  error <- ifelse(contam == 0,
-                  rnorm(n, 0, 1),
-                  rnorm(n, 0, 5))
-  
-  #Laplace distribution
-  #error<-rLaplace(n)
-  
-  # Heteroskedastic error where variance depends on x1 and x2
-  #sigma_2 <- sqrt(abs(beta[1] + beta[2]*x_1 + beta[3]*x_2+beta[4]*e_1))
-  
-  #error <- rnorm(n, mean = 0, sd = sigma_2)
+  epsilon <- rnorm(n)
   
   ## Latent variable
-  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2  + beta[4] * (e_1) + error
+  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2  + beta[4] * v_1 + epsilon
   
   ## Censored outcome
   y <- pmax(0, y_star)
@@ -437,7 +354,7 @@ f_1_huber<- function(beta, n) {
   cp_h<-(sum(y==0)/length(y))*100
   
   data <- data.frame(y, x_1, x_2, res)
-  out<-Tun_cons(beta,n)
+  out<-Tun_cons(beta,delta,n)
   
   # =========================
   # Stage 2: Huber Tobit (CF)
@@ -450,61 +367,40 @@ f_1_huber<- function(beta, n) {
   }
   
   # Use MLE as initial values
-  mle_p<-mle_par(beta,n)
+  mle_p<-mle_par(beta, delta, n)
   init <- as.numeric(mle_p)
   
   huber_fit <- optim(init, f2, method = "Nelder-Mead")
   
   c(huber_fit$par, cp_h)
 }
-f_1_huber(c(1,2,3,0.5),1000)
+f_1_huber(c(1,2,3,0.5),c(1,2,3),100)
 
 ### Hampel loss optimization
 set.seed(123)
-f_1_hampel<-function(beta, n) {
+f_1_hampel<-function(beta, delta, n) {
   
   ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
+  z_1<-runif(n)
+  v_1<-rnorm(n)
+  x_1<-rnorm(n)
   
   ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
+  x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
   
   # =========================
   # Stage 1: LSE
   # =========================
-  res <- residuals(lm(x_2 ~ z + x_1))
+  res <- residuals(lm(x_2 ~ z_1 + x_1))
   
   ## Structural error
   
   ## Standard Normal
-  #error <- rnorm(n)
+  epsilon <- rnorm(n)
   
-  # Cauchy distribution
-  #error <-rcauchy(n)
-  
-  ## Student t Distribution
-    #error <- rt(n,3)
-    
-  # Indicator for contaminated observations
-  contam <- rbinom(n, 1, 0.20)
-  
-  # Generate contaminated errors
-  error <- ifelse(contam == 0,
-                  rnorm(n, 0, 1),
-                  rnorm(n, 0, 5))
-  
-  #Laplace distribution
-  #error<-rLaplace(n)
-  
-  # Heteroskedastic error where variance depends on x1 and x2
-  #sigma_2 <- sqrt(abs(beta[1] + beta[2]*x_1 + beta[3]*x_2+beta[4]*e_1))
-  
-  #error <- rnorm(n, mean = 0, sd = sigma_2)
   
   ## Latent variable
-  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4] *e_1 + error
+  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4] *v_1 + epsilon
   
   ## Censored outcome
   y <- pmax(0, y_star)
@@ -514,12 +410,11 @@ f_1_hampel<-function(beta, n) {
   data <- data.frame(y, x_1, x_2, res)
   
   #tunning constant
-  out<-Tun_cons(beta,n)
+  out<-Tun_cons(beta,delta,n)
   
   # =========================
   # Hample Tobit
   # =========================
-  
   f3 <- function(theta) {
     mu_hat <- theta[1] + theta[2]*x_1 + theta[3]*x_2 + theta[4]*res
     r <- y - pmax(out[("Hampel_c")], mu_hat)
@@ -527,7 +422,7 @@ f_1_hampel<-function(beta, n) {
   }
   
   # Use MLE as initial values
-  mle_p<-mle_par(beta,n)
+  mle_p<-mle_par(beta, delta, n)
   init <- as.numeric(mle_p)
   
   fit <- optim(init, f3, method = "Nelder-Mead")
@@ -538,50 +433,29 @@ f_1_hampel<-function(beta, n) {
 
 ### Tukey loss optimization
 set.seed(123)
-f_1_tukey<- function(beta, n) {
+f_1_tukey<- function(beta,delta, n) {
   
   ## Instruments and regressors
-  z   <- runif(n)
-  e_1 <- rnorm(n)
-  x_1 <- rnorm(n)
+  z_1<-runif(n)
+  v_1<-rnorm(n)
+  x_1<-rnorm(n)
   
   ## Endogenous regressor
-  x_2 <- beta[1] + beta[2]*x_1 + beta[3]*z + e_1
+  x_2 <- delta[1] + delta[2]*x_1 + delta[3]*z_1 + v_1
   
   # =========================
   # Stage 1: LSE
   # =========================
-  res <- residuals(lm(x_2 ~ z + x_1))
+  res <- residuals(lm(x_2 ~ z_1 + x_1))
   
   ## Structural error
   
   ## Standard Normal
-  #error <- rnorm(n)
+  epsilon <- rnorm(n)
   
-  # Cauchy distribution
-  #error <-rcauchy(n)
-  
-  ## Student t Distribution
-  #error <- rt(n,3)
-  
-  # Indicator for contaminated observations
-  contam <- rbinom(n, 1, 0.20)
-  
-  # Generate contaminated errors
-  error <- ifelse(contam == 0,
-                  rnorm(n, 0, 1),
-                  rnorm(n, 0, 5))
-  
-  #Laplace distribution
-  #error<-rLaplace(n)
-  
-  # Heteroskedastic error where variance depends on x1 and x2
-  #sigma_2 <- sqrt(abs(beta[1] + beta[2]*x_1 + beta[3]*x_2+beta[4]*e_1))
-  
-  #error <- rnorm(n, mean = 0, sd = sigma_2)
   
   ## Latent variable
-  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4] *e_1 + error
+  y_star <- beta[1] + beta[2]*x_1 + beta[3]*x_2 + beta[4] *v_1 + epsilon
   
   ## Censored outcome
   y <- pmax(0, y_star)
@@ -591,7 +465,7 @@ f_1_tukey<- function(beta, n) {
   data <- data.frame(y, x_1, x_2, res)
   
   ##Tunning constant
-  out<-Tun_cons(beta,n)
+  out<-Tun_cons(beta, delta , n)
   
   # =========================
   # Tukey Tobit
@@ -604,7 +478,7 @@ f_1_tukey<- function(beta, n) {
   }
   
   # Use MLE as initial values
-  mle_p<-mle_par(beta,n)
+  mle_p<-mle_par(beta, delta, n)
   init <- as.numeric(mle_p)
   
   fit <- optim(init, f4, method = "Nelder-Mead")
@@ -616,12 +490,13 @@ f_1_tukey<- function(beta, n) {
 # Monte Carlo parameters
 r    <- 2000
 beta <- c(1, 2, 3, 0.5)
+delta<-c(1,2,3)
 
 # Export necessary objects to cluster
 clusterExport(cl, c("huber_loss", "hampel_loss", "tukey_loss", "scls_loss",
                     "Tun_cons", "mle_par",
-                    "f_1_huber", "f_1_hampel", "f_1_tukey", "f_1_scls","f_1_clad",
-                    "beta", "r"))
+                    "f_1_huber", "f_1_hampel", "f_1_tukey", "f_1_scls","f_1_quantile",
+                    "beta","delta" ,"r"))
 
 clusterEvalQ(cl, {
   library(MASS)
@@ -663,17 +538,17 @@ cat("Running scls estimator...\n")
 results_scls <- foreach(N = sample_size, .combine = 'rbind',
                         .packages = c('MASS', 'ExtDist', 'AER', 'quantreg', 'survival')) %dopar% {
                           set.seed(123 + N)
-                          sims <- replicate(r, f_1_scls(beta, N))
+                          sims <- replicate(r, f_1_scls(beta,delta, N))
                           beta_hat <- sims[1:4, ]
                           c(compute_metrics(beta_hat, beta, "s"), cp_s = sims[5, 1])
                         }
 
-## Parallel CLAD estimation
-cat("Running Clad estimator...\n")
-results_clad <- foreach(N = sample_size, .combine = 'rbind',
+## Parallel quntile estimation
+cat("Running quantile estimator...\n")
+results_quantile <- foreach(N = sample_size, .combine = 'rbind',
                         .packages = c('MASS', 'ExtDist', 'AER', 'quantreg', 'survival')) %dopar% {
                           set.seed(123 + N)
-                          sims <- replicate(r, f_1_clad(beta, N))
+                          sims <- replicate(r, f_1_quantile(beta,delta, N))
                           beta_hat <- sims[1:4, ]
                           c(compute_metrics(beta_hat, beta, "c"), cp_d = sims[5, 1])
                         }
@@ -683,7 +558,7 @@ cat("Running WME estimator...\n")
 results_WME <- foreach(N = sample_size, .combine = 'rbind',
                        .packages = c('MASS', 'ExtDist', 'AER', 'quantreg', 'survival')) %dopar% {
                          set.seed(123 + N)
-                         sims <- replicate(r, f_1_huber(beta, N))
+                         sims <- replicate(r, f_1_huber(beta,delta, N))
                          beta_hat <- sims[1:4, ]
                          c(compute_metrics(beta_hat, beta, "W"), cp_h = sims[5, 1])
                        }
@@ -693,7 +568,7 @@ cat("Running hampel estimator...\n")
 results_hampel <- foreach(N = sample_size, .combine = 'rbind',
                           .packages = c('MASS', 'ExtDist', 'AER', 'quantreg', 'survival')) %dopar% {
                             set.seed(123 + N)
-                            sims <- replicate(r, f_1_hampel(beta, N))
+                            sims <- replicate(r, f_1_hampel(beta,delta, N))
                             beta_hat <- sims[1:4, ]
                             c(compute_metrics(beta_hat, beta, "h"), cp_hm = sims[5, 1])
                           }
@@ -703,7 +578,7 @@ cat("Running tukey estimator...\n")
 results_tukey <- foreach(N = sample_size, .combine = 'rbind',
                          .packages = c('MASS', 'ExtDist', 'AER', 'quantreg', 'survival')) %dopar% {
                            set.seed(123 + N)
-                           sims <- replicate(r, f_1_tukey(beta, N))
+                           sims <- replicate(r, f_1_tukey(beta,delta, N))
                            beta_hat <- sims[1:4, ]
                            c(compute_metrics(beta_hat, beta, "T"), cp_t = sims[5, 1])
                          }
@@ -733,7 +608,7 @@ extract_metrics <- function(results, prefix, cp_name) {
 }
 
 metrics_scls   <- extract_metrics(results_scls,   "s", "cp_s")
-metrics_clad   <- extract_metrics(results_clad,   "c", "cp_d")
+metrics_quantile<- extract_metrics(results_quantile,   "c", "cp_d")
 metrics_WME    <- extract_metrics(results_WME,    "W", "cp_h")
 metrics_hampel <- extract_metrics(results_hampel, "h", "cp_hm")
 metrics_tukey  <- extract_metrics(results_tukey,  "T", "cp_t")
@@ -742,9 +617,9 @@ metrics_tukey  <- extract_metrics(results_tukey,  "T", "cp_t")
 #idx <- c(1, 2, 10, 19, 20)
 idx <- seq(1,20,1)
 
-# ---- CLAD Results ----
-cat("CLAD Results:\n")
-print(round(data.frame(n = sample_size[idx], metrics_clad[idx, ]), 4))
+# ---- quantile Results ----
+cat("quantile Results:\n")
+print(round(data.frame(n = sample_size[idx], metrics_quantile[idx, ]), 4))
 
 # ---- SCLS Results ----
 cat("\nscls Results:\n")
@@ -754,7 +629,7 @@ print(round(data.frame(n = sample_size[idx], metrics_scls[idx, ]), 4))
 cat("\nWME Results:\n")
 print(round(data.frame(n = sample_size[idx], metrics_WME[idx, ]), 4))
 
-# ---- Hampel Results ----
+# ---- Hampel Results ----``
 cat("\nHampel Results:\n")
 print(round(data.frame(n = sample_size[idx], metrics_hampel[idx, ]), 4))
 
@@ -787,7 +662,7 @@ metric_name <- "MSE"  # change to "MeanBias", "MedBias", "MAE", or "MedAE" as ne
 
 for (j in 1:4) {
   plot_metric(
-    list(metrics_clad[[paste0(metric_name, "_c", j)]],
+    list(metrics_quantile[[paste0(metric_name, "_c", j)]],
          metrics_scls[[paste0(metric_name, "_s", j)]],
          metrics_WME[[paste0(metric_name, "_W", j)]],
          metrics_hampel[[paste0(metric_name, "_h", j)]],
