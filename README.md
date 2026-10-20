@@ -25,7 +25,7 @@ This folder includes code for the **simulated data study**, including:
 - Data generation for censored regression models with endogeneity  
 - Implementation of robust M-estimators (e.g.,  Huber, Hampel, Tukey, SCLS, Quantile)  
 - Monte Carlo simulations  
-- Mean Squared Error (MSE) computation, Mean Bias, median Bias, Median Absolute Error  
+- Mean Squared Error (MSE) computation, Mean Bias, Mean Absolute Error, Median Absolute Error  
 - 
 
 ➡️ Use this folder to reproduce all **simulation results** reported in the paper.
