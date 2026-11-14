@@ -1,7 +1,7 @@
 
 # Code for  
 **" M-Estimation in Censored Regression Model under Endogeneity"**  
-by *Swati Shukla, Subhra Sankar Dhar, and Shalabh*
+by *authors*
 
 ---
 
